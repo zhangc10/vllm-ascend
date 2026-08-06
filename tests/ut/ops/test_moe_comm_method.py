@@ -15,7 +15,6 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEPrepareOutput,
     MoEQuantParams,
     MoERoutingParams,
-    MoEWeights,
 )
 from vllm_ascend.ops.fused_moe.token_dispatcher import MoETokenDispatchOutput
 from vllm_ascend.quantization.methods.base import QuantType
@@ -174,10 +173,9 @@ class TestMoECommMethod(TestBase):
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
-    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.unified_apply_mlp")
     @patch("torch.npu.current_stream", MagicMock())
     def test_fused_experts_method(
-        self, mock_unified_apply_mlp, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context
+        self, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context
     ):
         # Mock forward context
         mock_context = MagicMock()
@@ -211,8 +209,10 @@ class TestMoECommMethod(TestBase):
         mock_td_instance.token_combine.return_value = torch.randn(4, 8)
         mock_token_dispatcher.return_value = mock_td_instance
 
-        # Mock unified_apply_mlp returns (tensor, event) tuple
-        mock_unified_apply_mlp.return_value = (torch.randn(6, 8), MagicMock())
+        # Mock scheme apply_mlp returns (tensor, event) tuple
+        mock_scheme = MagicMock()
+        mock_apply_mlp_output = (torch.randn(6, 8), MagicMock())
+        mock_scheme.apply_mlp.return_value = mock_apply_mlp_output
 
         # Create instance
         comm_impl = AllGatherCommImpl(self.moe_config)
@@ -234,10 +234,7 @@ class TestMoECommMethod(TestBase):
                 hidden_states=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                weights=MoEWeights(
-                    w1=[w1],
-                    w2=[w2],
-                ),
+                layer=MagicMock(),
                 routing=MoERoutingParams(
                     expert_map=None,
                     global_redundant_expert_num=0,
@@ -248,6 +245,7 @@ class TestMoECommMethod(TestBase):
                 need_trans=False,
                 dynamic_eplb=False,
                 quant=MoEQuantParams(),
+                moe_scheme=mock_scheme,
             )
         )
 
@@ -257,14 +255,14 @@ class TestMoECommMethod(TestBase):
         # Verify token_dispatch was called
         mock_td_instance.token_dispatch.assert_called_once()
 
-        # Verify unified_apply_mlp was called
-        mock_unified_apply_mlp.assert_called_once()
-        mlp_compute_input = mock_unified_apply_mlp.call_args.kwargs["mlp_compute_input"]
+        # Verify scheme apply_mlp was called
+        mock_scheme.apply_mlp.assert_called_once()
+        mlp_compute_input = mock_scheme.apply_mlp.call_args.args[0]
         self.assertFalse(mlp_compute_input.fusion)
         self.assertFalse(mlp_compute_input.quant.is_mxfp)
 
         # Verify token_combine was called
         mock_td_instance.token_combine.assert_called_once_with(
-            hidden_states=mock_unified_apply_mlp.return_value[0],
+            hidden_states=mock_apply_mlp_output[0],
             combine_metadata=mock_td_instance.token_dispatch.return_value.combine_metadata,
         )

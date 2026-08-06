@@ -25,6 +25,7 @@ from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 
@@ -35,7 +36,7 @@ from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult
-from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput, build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
@@ -183,38 +184,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             activation = "swigluoai_uninterleave"
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        w13_weight_list = getattr(layer, "w13_weight_list", None)
-        w2_weight_list = getattr(layer, "w2_weight_list", None)
-        has_split_weight_lists = isinstance(w13_weight_list, list) and isinstance(w2_weight_list, list)
-        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
-            if self.dynamic_eplb and not has_split_weight_lists:
-                logger.warning_once(
-                    "FUSED_MC2 is enabled with dynamic EPLB, but unquantized MoE weights are not split into "
-                    "tensor lists. This may cause accuracy issues or communication hangs."
-                )
-            w1 = w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight]
-            w2 = w2_weight_list if isinstance(w2_weight_list, list) else [layer.w2_weight]
-            w1_scale = [torch.tensor([], dtype=torch.int64)]
-            w2_scale = [torch.tensor([], dtype=torch.int64)]
-            w1_scale_bias = [torch.tensor([], dtype=torch.float32)]
-            w2_scale_bias = [torch.tensor([], dtype=torch.float32)]
-        else:
-            w1 = w13_weight_list if isinstance(w13_weight_list, list) else layer.w13_weight
-            w1_scale = None
-            w2 = w2_weight_list if isinstance(w2_weight_list, list) else layer.w2_weight
-            w2_scale = None
-            w1_scale_bias = None
-            w2_scale_bias = None
-
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
-                w1_bias=layer.w13_bias if self.moe.has_bias else None,
-                w2_bias=layer.w2_bias if self.moe.has_bias else None,
                 quant_type=QuantType.NONE,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -224,19 +198,136 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 log2phy=log2phy,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                w1_scale_bias=w1_scale_bias,
-                w2_scale_bias=w2_scale_bias,
-                swiglu_limit=layer.swiglu_limit,
-                swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
-                swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
-                lora_context=getattr(layer, "_ascend_moe_lora_context", None),
+                moe_scheme=self,
+                layer=layer,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states.routed_out += zero_expert_result
         return final_hidden_states
+
+    def apply_mlp(
+        self, mlp_compute_input: MoEMlpComputeInput
+    ) -> tuple[torch.Tensor, torch.npu.Event | None]:
+        from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
+
+        hidden_states = mlp_compute_input.hidden_states
+        group_list = mlp_compute_input.group_list
+        group_list_type = mlp_compute_input.group_list_type
+        topk_scales = mlp_compute_input.topk_scales
+        layer = mlp_compute_input.layer
+        w1 = layer.w13_weight
+        w2 = layer.w2_weight
+        w1_bias = layer.w13_bias if layer.moe.has_bias else None
+        w2_bias = layer.w2_bias if layer.moe.has_bias else None
+        activation = mlp_compute_input.activation
+        need_trans = mlp_compute_input.need_trans
+        swiglu_limit = layer.swiglu_limit
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.0)
+        swiglu_beta = getattr(layer, "swiglu_beta", 0.0)
+        lora_context = getattr(layer, "_ascend_moe_lora_context", None)
+        expanded_row_idx = mlp_compute_input.expanded_row_idx
+        topk_ids = mlp_compute_input.topk_ids
+
+        if need_trans:
+            w1 = w1.transpose(1, 2)
+            w2 = w2.transpose(1, 2)
+
+        gate_up_out = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w1],
+            bias=[w1_bias.to(dtype=torch.float32)] if w1_bias is not None else None,
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+        )[0]
+
+        # MoE LoRA: only attempt injection when an adapter wraps this layer and
+        # the comm method provided routing metadata in lora_context.
+        # Two paths are supported:
+        #   - AllGather: expanded_row_idx + topk_ids from npu_moe_init_routing
+        #   - AlltoAll:  lora_context.exchanged_lora_indices + group_list after all_to_all
+        lora_routing = None
+        if lora_context is not None:  # LoRA applied
+            from vllm_ascend.lora.fused_moe import (
+                _recover_moe_lora_routing_all2all,
+                _recover_moe_lora_routing_allgather,
+                moe_lora_apply_w2,
+                moe_lora_apply_w13,
+            )
+
+            if expanded_row_idx is not None and topk_ids is not None:
+                # AllGather path: use npu_moe_init_routing's expanded_row_idx.
+                lora_routing = _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids)
+            elif getattr(lora_context, "exchanged_lora_indices", None) is not None:
+                # AlltoAll path: tokens already sorted by expert after exchange.
+                # Build per-row (expert_id, lora_id) directly from group_list.
+                lora_routing = _recover_moe_lora_routing_all2all(lora_context, group_list=group_list)
+            else:
+                raise AssertionError(
+                    "MoE LoRA requires either expanded_row_idx+topk_ids "
+                    "(AllGather) or lora_context.exchanged_lora_indices "
+                    "(AlltoAll). Neither was provided."
+                )
+
+            moe_lora_apply_w13(
+                lora_context,
+                gate_up_out=gate_up_out,
+                hidden_states=hidden_states,
+                lora_routing=lora_routing,
+            )
+
+        act_name = getattr(activation, "value", activation)
+        if activation == MoEActivation.SWIGLUOAI:
+            num_experts, _, hidden_size = w1.shape
+            gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
+        elif act_name == "swigluoai_uninterleave":
+            gate_up_out = torch_npu.npu_clipped_swiglu(
+                gate_up_out,
+                interleaved=False,
+                alpha=swiglu_alpha,
+                limit=swiglu_limit,
+                bias=swiglu_beta,
+            )
+        elif activation == MoEActivation.SWIGLUSTEP:
+            gate_up_out = AscendSwigluStepAndMul.swiglustep_forward(gate_up_out, limit=swiglu_limit or 7.0)
+        elif activation == MoEActivation.GELU:
+            gate, up = gate_up_out.chunk(2, dim=-1)
+            gate_up_out = torch.nn.functional.gelu(gate) * up
+        elif activation == MoEActivation.GELU_TANH:
+            gate, up = gate_up_out.chunk(2, dim=-1)
+            gate_up_out = torch.nn.functional.gelu(gate, approximate="tanh") * up
+        else:
+            if swiglu_limit > 0:
+                gate, up = gate_up_out.chunk(2, dim=-1)
+                gate.clamp_(max=swiglu_limit)
+                up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+            gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+        if topk_scales is not None:
+            gate_up_out *= topk_scales
+
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[gate_up_out],
+            weight=[w2],
+            bias=[w2_bias.to(dtype=torch.float32)] if w2_bias is not None else None,
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+        )[0]
+
+        # LoRA w2 delta: applied to the down-proj output, with the activation output
+        # as the lora_a input. Reuses the per-row routing computed for w13.
+        if lora_routing is not None:
+            moe_lora_apply_w2(
+                lora_context,
+                down_out=hidden_states,
+                silu_out=gate_up_out,
+                lora_routing=lora_routing,
+            )
+        return hidden_states, None
 
 
 def use_multistage_eplb_load(dynamic_eplb: bool, policy_type: int, collection_interval: int) -> bool:

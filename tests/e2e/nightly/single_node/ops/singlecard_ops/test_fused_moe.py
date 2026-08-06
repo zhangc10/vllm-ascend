@@ -29,7 +29,6 @@ import torch.nn.functional as F
 import torch_npu
 
 from vllm_ascend.ops.fused_moe.experts_selector import check_npu_moe_gating_top_k, select_experts
-from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEQuantParams,
     MoERoutingParams,
@@ -38,6 +37,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     build_mlp_compute_input,
 )
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
+from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
 from vllm_ascend.quantization.quant_type import QuantType
 
 NUM_EXPERTS = [8, 64]
@@ -251,11 +251,12 @@ def test_token_dispatcher_with_all_gather_quant(
             expert_map=expert_map,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
+            moe_scheme=AscendW8A8DynamicFusedMoEMethod.__new__(AscendW8A8DynamicFusedMoEMethod),
         ),
         token_dispatch_output=token_dispatch_output,
         use_fusion_ops=False,
     )
-    expert_output = unified_apply_mlp(mlp_compute_input=mlp_compute_input)
+    expert_output, _ = mlp_compute_input.moe_scheme.apply_mlp(mlp_compute_input)
     combined_output = dispatcher.token_combine(
         hidden_states=expert_output, combine_metadata=combine_metadata, bias=None
     )

@@ -27,8 +27,8 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, _MEGA_MOE_SUPPORTED, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
-from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, enable_dsa_cp, maybe_trans_nz
+from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput, build_fused_experts_input
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, dispose_tensor, enable_dsa_cp, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -294,44 +294,12 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         assert topk_weights is not None
         topk_weights = topk_weights.to(self.in_dtype)
 
-        act_name = getattr(activation, "value", activation)
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        fused_scale_flag = (
-            _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
-            and get_ascend_config().enable_fused_mc2 == 1
-            and act_name != "swigluoai_uninterleave"
-        )
-        if self.dynamic_eplb:
-            w1 = layer.w13_weight_list
-            w1_scale = layer.fused_w1_scale_list if fused_scale_flag else layer.w13_weight_scale_fp32_list
-            w2 = layer.w2_weight_list
-            w2_scale = layer.fused_w2_scale_list if fused_scale_flag else layer.w2_weight_scale_list
-            w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
-            w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
-
-        elif fused_scale_flag and _MEGA_MOE_SUPPORTED:
-            w1 = layer.cann_mega_moe_w13_weight_list
-            w1_scale = layer.cann_mega_moe_fused_w1_scale_list
-            w2 = layer.cann_mega_moe_w2_weight_list
-            w2_scale = layer.cann_mega_moe_fused_w2_scale_list
-            w1_scale_bias = None
-            w2_scale_bias = None
-
-        else:
-            w1 = [layer.w13_weight]
-            w1_scale = [layer.fused_w1_scale] if fused_scale_flag else [layer.w13_weight_scale_fp32]
-            w2 = [layer.w2_weight]
-            w2_scale = [layer.fused_w2_scale] if fused_scale_flag else [layer.w2_weight_scale]
-            w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
-            w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
-
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -341,18 +309,171 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 log2phy=log2phy,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                w1_scale_bias=w1_scale_bias,
-                w2_scale_bias=w2_scale_bias,
-                swiglu_limit=layer.swiglu_limit,
-                swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
-                swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
+                moe_scheme=self,
+                layer=layer,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
         return final_hidden_states
+
+    def apply_mlp(
+        self, mlp_compute_input: MoEMlpComputeInput
+    ) -> tuple[torch.Tensor, torch.npu.Event | None]:
+        layer = mlp_compute_input.layer
+        hidden_states = mlp_compute_input.hidden_states
+        group_list = mlp_compute_input.group_list
+        group_list_type = mlp_compute_input.group_list_type
+        dynamic_scale = mlp_compute_input.dynamic_scale
+        activation = mlp_compute_input.activation
+        fusion = mlp_compute_input.fusion
+        dynamic_eplb = mlp_compute_input.dynamic_eplb
+
+        act_name = getattr(activation, "value", activation)
+        is_swigluoai_uninterleave = act_name == "swigluoai_uninterleave"
+        act_quant_type = torch.int8 if mlp_compute_input.quant.is_int_quant else torch.float8_e4m3fn
+        swiglu_limit = layer.swiglu_limit
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.0)
+        swiglu_beta = getattr(layer, "swiglu_beta", 0.0)
+
+        if dynamic_eplb:
+            w1 = layer.w13_weight_list
+            w1_scale = layer.w13_weight_scale_fp32_list
+            w2 = layer.w2_weight_list
+            w2_scale = layer.w2_weight_scale_list
+        else:
+            w1 = [layer.w13_weight]
+            w1_scale = [layer.w13_weight_scale_fp32]
+            w2 = [layer.w2_weight]
+            w2_scale = [layer.w2_weight_scale]
+
+        _output_dtype = w2_scale[0].dtype
+        # activation quantization
+        if dynamic_scale is None:
+            unquantized_hidden_states = hidden_states
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=act_quant_type
+            )
+            dispose_tensor(unquantized_hidden_states)
+            quantized_hidden_states = None
+        else:
+            pertoken_scale = dynamic_scale
+            quantized_hidden_states = hidden_states
+        # GMM1 + Act + Quant
+        use_dequant_gmm = False
+        if self._can_use_fused_op(activation):
+            if fusion and dynamic_eplb and self._enable_custom_op():
+                hidden_states, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz_tensor_list(
+                        x=hidden_states,
+                        weight=w1,
+                        weight_scale=w1_scale,
+                        x_scale=pertoken_scale,
+                        group_list=self.cumsum_group_list(group_list, group_list_type, 0),
+                        swiglu_limit=swiglu_limit,
+                    )
+            elif fusion and not dynamic_eplb:
+                from vllm_ascend.device.device_op import DeviceOperator
+
+                hidden_states, swiglu_out_scale, _ = DeviceOperator.npu_grouped_matmul_swiglu_quant(
+                    x=hidden_states,
+                    weight=w1[0],
+                    group_list=self.cumsum_group_list(group_list, group_list_type, 0),
+                    weight_scale=w1_scale[0],
+                    x_scale=pertoken_scale,
+                    bias=None,
+                    act_quant_type=act_quant_type,
+                    swiglu_limit=swiglu_limit,
+                )
+                if quantized_hidden_states is not None:
+                    dispose_tensor(quantized_hidden_states)
+            else:
+                # fallback in case fusion_ops_gmmswigluquant config is disabled or custom_op=False
+                use_dequant_gmm = True
+        else:
+            if is_swigluoai_uninterleave:
+                use_dequant_gmm = True
+            else:
+                gmm1_kwargs = {
+                    "x": [hidden_states],
+                    "weight": w1,
+                    "scale": [w1_scale[0].to(w2_scale[0].dtype)],
+                    "bias": None,
+                    "per_token_scale": [pertoken_scale],
+                    "split_item": 2,
+                    "group_type": 0,
+                    "group_list": group_list,
+                    "group_list_type": group_list_type,
+                    "output_dtype": _output_dtype,
+                }
+                hidden_states = torch_npu.npu_grouped_matmul(**gmm1_kwargs)[0]
+                if quantized_hidden_states is not None:
+                    dispose_tensor(quantized_hidden_states)
+                hidden_states, swiglu_out_scale = self._non_fused_act_quant(
+                    activation,
+                    hidden_states,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                    use_mxfp_quant=False,
+                    act_quant_type=act_quant_type,
+                    group_list=group_list,
+                    group_list_type=group_list_type,
+                )
+
+        if use_dequant_gmm:
+            if w1_scale[0].dtype != torch.float32:
+                w1_scale[0] = w1_scale[0].to(torch.float32)
+            hidden_states = torch_npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=w1,
+                split_item=3,
+                group_list_type=group_list_type,
+                group_type=0,
+                group_list=group_list,
+                output_dtype=torch.int32,
+            )[0]
+            if quantized_hidden_states is not None:
+                dispose_tensor(quantized_hidden_states)
+            dequant_swiglu_kwargs = {
+                "x": hidden_states,
+                "weight_scale": w1_scale[0],
+                "activation_scale": pertoken_scale,
+                "bias": None,
+                "quant_scale": None,
+                "quant_offset": None,
+                "group_index": self.cumsum_group_list(group_list, group_list_type, 1),
+                "activate_left": True,
+                "quant_mode": 1,
+            }
+            if is_swigluoai_uninterleave:
+                dequant_swiglu_kwargs.update(
+                    {
+                        "swiglu_mode": 1,
+                        "clamp_limit": swiglu_limit,
+                        "glu_alpha": swiglu_alpha,
+                        "glu_bias": swiglu_beta,
+                    }
+                )
+            hidden_states, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(**dequant_swiglu_kwargs)
+
+        before_gmm2_evt = torch.npu.current_stream().record_event()
+        # GMM2
+        gmm2_output_dtype = _output_dtype
+        if act_quant_type == torch.float8_e4m3fn:
+            gmm2_output_dtype = torch.bfloat16
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=w2,
+            scale=w2_scale,
+            bias=None,
+            per_token_scale=[swiglu_out_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=gmm2_output_dtype,
+        )[0]
+        return hidden_states, before_gmm2_evt
 
     def process_weights_after_loading(self, layer):
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()

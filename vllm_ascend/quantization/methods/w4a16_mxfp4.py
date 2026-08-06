@@ -31,7 +31,7 @@ from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp4_moe_available,
 )
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput, build_fused_experts_input
 
 from .base import AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -178,8 +178,6 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -189,16 +187,52 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
                 log2phy=log2phy,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
-                mxfp_act_quant_type=None,
-                mxfp_weight_quant_type=torch_npu.float4_e2m1fn_x2,
-                mxfp_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-                mxfp_per_token_scale_dtype=None,
-                mxfp_use_bf16=(x.dtype == torch.bfloat16),
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                swiglu_limit=layer.swiglu_limit,
+                moe_scheme=self,
+                layer=layer,
             )
         )
+
+    def apply_mlp(
+        self, mlp_compute_input: MoEMlpComputeInput
+    ) -> tuple[torch.Tensor, torch.npu.Event | None]:
+        layer = mlp_compute_input.layer
+        hidden_states = mlp_compute_input.hidden_states
+        group_list = mlp_compute_input.group_list
+        group_list_type = mlp_compute_input.group_list_type
+        input_hidden_dtype = hidden_states.dtype
+        use_bf16 = input_hidden_dtype == torch.bfloat16
+
+        # GMM1 + Act
+        group_list_cumsum = self.cumsum_group_list(group_list, group_list_type, 0)
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w13_weight],
+            antiquant_scale=[layer.w13_weight_scale],
+            group_list=group_list_cumsum,
+            split_item=3,
+            group_type=0,
+            output_dtype=hidden_states.dtype,
+        )[0]
+        hidden_states = torch_npu.npu_swiglu(hidden_states)
+
+        before_gmm2_evt = torch.npu.current_stream().record_event()
+        # GMM2 (antiquant)
+        output_dtype = (
+            input_hidden_dtype
+            if input_hidden_dtype in [torch.bfloat16, torch.float16]
+            else (torch.bfloat16 if use_bf16 else torch.float16)
+        )
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w2_weight],
+            antiquant_scale=[layer.w2_weight_scale],
+            split_item=3,
+            group_type=0,
+            group_list_type=group_list_type,
+            group_list=group_list,
+            output_dtype=output_dtype,
+        )[0]
+        return hidden_states, before_gmm2_evt
 
     def process_weights_after_loading(self, layer):
         layer.w13_weight.data = unpack_uint8_to_fp4_return_float32(layer.w13_weight.data)

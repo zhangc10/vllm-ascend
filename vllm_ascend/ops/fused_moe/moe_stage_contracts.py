@@ -40,29 +40,12 @@ class MoEPrepareOutput:
 
 
 @dataclass(frozen=True, slots=True)
-class MoEWeights:
-    """Dense and quantized weight payloads consumed by MoE execution."""
-
-    w1: torch.Tensor | list[torch.Tensor]
-    w2: torch.Tensor | list[torch.Tensor]
-    w1_bias: torch.Tensor | None = None
-    w2_bias: torch.Tensor | None = None
-    w1_scale: torch.Tensor | list[torch.Tensor] | None = None
-    w2_scale: torch.Tensor | list[torch.Tensor] | None = None
-    w1_scale_bias: torch.Tensor | list[torch.Tensor] | None = None
-    w2_scale_bias: torch.Tensor | list[torch.Tensor] | None = None
-    w1_offset: torch.Tensor | None = None
-    w2_offset: torch.Tensor | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class MoEFusedExpertsInput:
     """Top-level input for the routed experts pipeline."""
 
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    weights: MoEWeights
     routing: MoERoutingParams
     quant: MoEQuantParams
     activation: str = "silu"
@@ -72,9 +55,12 @@ class MoEFusedExpertsInput:
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     # Optional per-layer MoE LoRA state (vllm_ascend.lora MoELoRAContext).
-    # ``Any`` avoids coupling the core contracts to the LoRA module; only the
-    # unquant MLP path reads it, and only when a LoRA adapter is active.
     lora_context: Any = None
+    # The quant scheme that owns this MoE invocation.
+    moe_scheme: Any = None
+    # The MoE layer module, passed through so apply_mlp / FusedMC2CommImpl
+    # can read weight attributes directly.
+    layer: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +126,6 @@ class MoEMlpComputeInput:
     group_list_type: int
     dynamic_scale: torch.Tensor | None
     topk_scales: torch.Tensor | None
-    weights: MoEWeights
     quant: MoEQuantParams
     fusion: bool
     activation: str = "silu"
@@ -151,13 +136,13 @@ class MoEMlpComputeInput:
     swiglu_beta: float = 0.0
     expanded_row_idx: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
-    # Optional per-layer MoE LoRA state, propagated from MoEFusedExpertsInput.
     lora_context: Any = None
+    moe_scheme: Any = None
+    layer: Any = None
 
 
 __all__ = [
     "MoEPrepareOutput",
-    "MoEWeights",
     "MoEFusedExpertsInput",
     "MoETokenDispatchInput",
     "MoEMC2CombineMetadata",

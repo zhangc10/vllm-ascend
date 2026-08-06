@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from vllm.logger import logger
@@ -26,7 +27,6 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, _MEGA_MOE_SUPPORTED, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe import comm_utils
-from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
     MoEMlpComputeInput,
@@ -184,8 +184,8 @@ class MoECommMethod(ABC):
             swiglu_beta=fused_experts_input.swiglu_beta,
         )
 
-    def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
-        return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
+    def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> tuple[torch.Tensor, Any]:
+        return mlp_compute_input.moe_scheme.apply_mlp(mlp_compute_input)
 
     @abstractmethod
     def _get_token_dispatcher(self) -> MoETokenDispatcher:
@@ -361,31 +361,52 @@ class FusedMC2CommImpl(MoECommMethod):
         fused_experts_input: MoEFusedExpertsInput,
         topk_ids: torch.Tensor,
     ):
-        assert fused_experts_input.weights.w1_scale is not None
-        assert fused_experts_input.weights.w2_scale is not None
-        # TokenDispatcherWithMC2 carries global_bs (used below for the mc2_mask
-        # branch); assert the subtype so mypy resolves it off the base class.
-        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        from vllm_ascend.quantization.quant_type import QuantType
 
-        def to_list(x):
-            return x if isinstance(x, list) else [x]
+        layer = fused_experts_input.layer
+        quant_type = fused_experts_input.quant.quant_type
 
-        weight1 = to_list(fused_experts_input.weights.w1)
-        weight2 = to_list(fused_experts_input.weights.w2)
-        # A8W4-INT MegaMoe reads N from weight1.storageShape.lastDim treated as int8 (N = lastDim*2)
-        # and checks weight2.dim0 == N/2, so the weights MUST be int8-shaped (two int4 per byte), NOT
-        # the eight-int4-per-int32 packing (that makes the op read N four times too small and fail
-        # CheckWeight2Input). The op prototype also REQUIRES FRACTAL_NZ per expert. The W4A8 quant
-        # method therefore builds per-expert int8 + FRACTAL_NZ lists (cann_mega_moe_*_weight_list) and
-        # they are passed through as-is here. W8A8 weights are already int8 + FRACTAL_NZ, also as-is.
-        weight_scales1 = to_list(fused_experts_input.weights.w1_scale)
-        weight_scales2 = to_list(fused_experts_input.weights.w2_scale)
+        if quant_type == QuantType.W8A8 or quant_type == QuantType.W8A8FP:
+            weight1 = layer.cann_mega_moe_w13_weight_list
+            weight2 = layer.cann_mega_moe_w2_weight_list
+            weight_scales1 = layer.cann_mega_moe_fused_w1_scale_list
+            weight_scales2 = layer.cann_mega_moe_fused_w2_scale_list
+            l1_bias = None
+            l2_bias = None
+        elif quant_type == QuantType.W4A8:
+            weight1 = layer.cann_mega_moe_w13_weight_list
+            weight2 = layer.cann_mega_moe_w2_weight_list
+            weight_scales1 = list(layer.cann_mega_moe_w13_weight_scale_list)
+            weight_scales2 = list(layer.cann_mega_moe_w2_weight_scale_list)
+
+            def cast_bias_to_fp32(bias):
+                lst = bias if isinstance(bias, list) else [bias]
+                return [t if t.dtype == torch.float32 else t.to(torch.float32) for t in lst]
+
+            l1_bias = cast_bias_to_fp32(layer.cann_mega_moe_w13_scale_bias_list)
+            l2_bias = cast_bias_to_fp32(layer.cann_mega_moe_w2_scale_bias_list)
+        elif quant_type == QuantType.NONE:
+            w13_weight_list = getattr(layer, "w13_weight_list", None)
+            w2_weight_list = getattr(layer, "w2_weight_list", None)
+            weight1 = w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight]
+            weight2 = w2_weight_list if isinstance(w2_weight_list, list) else [layer.w2_weight]
+            weight_scales1 = [torch.tensor([], dtype=torch.int64)]
+            weight_scales2 = [torch.tensor([], dtype=torch.int64)]
+            l1_bias = [torch.tensor([], dtype=torch.float32)]
+            l2_bias = [torch.tensor([], dtype=torch.float32)]
+        else:
+            raise NotImplementedError(f"FusedMC2 not supported for quant_type={quant_type}")
+
         # MegaMoe requires per-expert weight scales to be 1-D. The W4A8 method
         # squeezes w13 scales but leaves w2 scales as [1, hidden]; drop the
         # leading singleton dim so CheckWeightScaleInput passes. Guarded to the
         # [1, N] per-channel case to avoid flattening genuine per-group scales.
         weight_scales1 = [t.squeeze(0) if (t.dim() == 2 and t.shape[0] == 1) else t for t in weight_scales1]
         weight_scales2 = [t.squeeze(0) if (t.dim() == 2 and t.shape[0] == 1) else t for t in weight_scales2]
+
+        # TokenDispatcherWithMC2 carries global_bs (used below for the mc2_mask
+        # branch); assert the subtype so mypy resolves it off the base class.
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
 
         if self._mega_moe_symm_buffer is None:
             self._init_mega_moe_symm_buffer(
@@ -405,9 +426,6 @@ class FusedMC2CommImpl(MoECommMethod):
                 x_active_mask = raw_mask.contiguous()
             else:
                 x_active_mask = raw_mask.to(torch.int8).contiguous()
-        # A8W4-INT precision-compensation biases B1/B2 (l1_bias/l2_bias).
-        l1_bias = fused_experts_input.weights.w1_scale_bias
-        l2_bias = fused_experts_input.weights.w2_scale_bias
 
         out, expert_tokens = self.mega_moe(
             fused_experts_input.hidden_states,
@@ -436,10 +454,6 @@ class FusedMC2CommImpl(MoECommMethod):
         self,
         fused_experts_input: MoEFusedExpertsInput,
     ):
-        assert not (fused_experts_input.weights.w1_scale is None or fused_experts_input.weights.w2_scale is None), (
-            "w1_scale and w2_scale cannot be None for FusedMC2CommImpl."
-        )
-
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
@@ -454,21 +468,57 @@ class FusedMC2CommImpl(MoECommMethod):
             if _MEGA_MOE_SUPPORTED:
                 out, expert_tokens = self._apply_cann_mega_moe(fused_experts_input, topk_ids)
             else:
-                assert not (
-                    fused_experts_input.weights.w1_scale_bias is None
-                    or fused_experts_input.weights.w2_scale_bias is None
-                ), "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
+                from vllm_ascend.quantization.quant_type import QuantType
+
+                layer = fused_experts_input.layer
+                quant_type = fused_experts_input.quant.quant_type
+
+                if quant_type in (QuantType.W8A8, QuantType.W8A8FP):
+                    w1 = layer.w13_weight_list if self.dynamic_eplb else [layer.w13_weight]
+                    w1_scale = layer.fused_w1_scale_list if self.dynamic_eplb else [layer.fused_w1_scale]
+                    w2 = layer.w2_weight_list if self.dynamic_eplb else [layer.w2_weight]
+                    w2_scale = layer.fused_w2_scale_list if self.dynamic_eplb else [layer.fused_w2_scale]
+                    w1_scale_bias = [torch.tensor([], dtype=torch.float32)]
+                    w2_scale_bias = [torch.tensor([], dtype=torch.float32)]
+                elif quant_type == QuantType.W4A8:
+                    w1 = layer.cann_mega_moe_w13_weight_list
+                    w1_scale = layer.cann_mega_moe_w13_weight_scale_list
+                    w2 = layer.cann_mega_moe_w2_weight_list
+                    w2_scale = layer.cann_mega_moe_w2_weight_scale_list
+                    w1_scale_bias = layer.cann_mega_moe_w13_scale_bias_list
+                    w2_scale_bias = layer.cann_mega_moe_w2_scale_bias_list
+                elif quant_type == QuantType.NONE:
+                    w13_weight_list = getattr(layer, "w13_weight_list", None)
+                    w2_weight_list = getattr(layer, "w2_weight_list", None)
+                    has_split_weight_lists = isinstance(w13_weight_list, list) and isinstance(w2_weight_list, list)
+                    if fused_experts_input.dynamic_eplb and not has_split_weight_lists:
+                        logger.warning_once(
+                            "FUSED_MC2 is enabled with dynamic EPLB, but unquantized MoE weights are not split into "
+                            "tensor lists. This may cause accuracy issues or communication hangs."
+                        )
+                    w1 = w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight]
+                    w2 = w2_weight_list if isinstance(w2_weight_list, list) else [layer.w2_weight]
+                    w1_scale = [torch.tensor([], dtype=torch.int64)]
+                    w2_scale = [torch.tensor([], dtype=torch.int64)]
+                    w1_scale_bias = [torch.tensor([], dtype=torch.float32)]
+                    w2_scale_bias = [torch.tensor([], dtype=torch.float32)]
+                else:
+                    raise NotImplementedError(f"FusedMC2 not supported for quant_type={quant_type}")
+
+                assert w1_scale_bias is not None and w2_scale_bias is not None, (
+                    "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
+                )
 
                 out = torch.empty_like(fused_experts_input.hidden_states)
                 torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
                     x=fused_experts_input.hidden_states,
-                    weight1=fused_experts_input.weights.w1,
-                    weight2=fused_experts_input.weights.w2,
+                    weight1=w1,
+                    weight2=w2,
                     expert_idx=topk_ids,
-                    scale1=fused_experts_input.weights.w1_scale,
-                    scale2=fused_experts_input.weights.w2_scale,
-                    bias1=fused_experts_input.weights.w1_scale_bias,
-                    bias2=fused_experts_input.weights.w2_scale_bias,
+                    scale1=w1_scale,
+                    scale2=w2_scale,
+                    bias1=w1_scale_bias,
+                    bias2=w2_scale_bias,
                     probs=fused_experts_input.topk_weights.to(torch.float32),
                     group=self.token_dispatcher.moe_all_to_all_group_name,
                     max_output_size=get_ascend_config().mega_moe_max_tokens,

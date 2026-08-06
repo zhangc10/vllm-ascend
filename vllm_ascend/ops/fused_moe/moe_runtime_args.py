@@ -32,9 +32,10 @@ Relationship overview:
 
       fused_experts input
         -> MoEFusedExpertsInput
-            |- weights: MoEWeights
             |- routing: MoERoutingParams
             |- quant: MoEQuantParams
+            |- layer: (layer module with weight attributes)
+            |- moe_scheme: (AscendMoEScheme subclass)
 
       dispatch
         input  -> MoETokenDispatchInput
@@ -69,7 +70,6 @@ from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
     MoEPrepareOutput,
     MoETokenDispatchInput,
     MoETokenDispatchOutput,
-    MoEWeights,
     TMoECombineMetadata,
 )
 from vllm_ascend.ops.fused_moe.moe_stage_params import (
@@ -118,8 +118,6 @@ def build_fused_experts_input(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    w1: torch.Tensor | list[torch.Tensor],
-    w2: torch.Tensor | list[torch.Tensor],
     quant_type: QuantType,
     dynamic_eplb: bool,
     expert_map: torch.Tensor | None = None,
@@ -130,8 +128,6 @@ def build_fused_experts_input(
     pertoken_scale: torch.Tensor | None = None,
     activation: str = "silu",
     need_trans: bool = False,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
     comm_quant_mode: int | None = None,
     mxfp_act_quant_type: torch.dtype | None = None,
     mxfp_weight_quant_type: torch.dtype | None = None,
@@ -139,16 +135,12 @@ def build_fused_experts_input(
     mxfp_per_token_scale_dtype: torch.dtype | None = None,
     mxfp_use_bf16: bool | None = None,
     is_per_channel_weight: bool = False,
-    w1_scale: list[torch.Tensor] | torch.Tensor | None = None,
-    w2_scale: list[torch.Tensor] | torch.Tensor | None = None,
-    w1_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
-    w2_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
-    w1_offset: torch.Tensor | None = None,
-    w2_offset: torch.Tensor | None = None,
     swiglu_limit: float | None = 0.0,
     swiglu_alpha: float | None = 1.0,
     swiglu_beta: float | None = 0.0,
     lora_context=None,
+    moe_scheme=None,
+    layer=None,
 ) -> MoEFusedExpertsInput:
     if swiglu_limit is None:
         swiglu_limit = 0.0
@@ -164,18 +156,6 @@ def build_fused_experts_input(
         hidden_states=hidden_states,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        weights=MoEWeights(
-            w1=w1,
-            w2=w2,
-            w1_bias=w1_bias,
-            w2_bias=w2_bias,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w1_scale_bias=w1_scale_bias,
-            w2_scale_bias=w2_scale_bias,
-            w1_offset=w1_offset,
-            w2_offset=w2_offset,
-        ),
         routing=MoERoutingParams(
             expert_map=expert_map,
             global_redundant_expert_num=global_redundant_expert_num,
@@ -204,6 +184,8 @@ def build_fused_experts_input(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         lora_context=lora_context,
+        moe_scheme=moe_scheme,
+        layer=layer,
     )
 
 
@@ -238,7 +220,6 @@ def build_mlp_compute_input(
         group_list_type=token_dispatch_output.group_list_type,
         dynamic_scale=token_dispatch_output.dynamic_scale,
         topk_scales=token_dispatch_output.topk_scales,
-        weights=fused_experts_input.weights,
         quant=fused_experts_input.quant,
         fusion=fused_experts_input.quant.quant_type
         in (
@@ -259,6 +240,8 @@ def build_mlp_compute_input(
         expanded_row_idx=expanded_row_idx,
         topk_ids=fused_experts_input.topk_ids,
         lora_context=fused_experts_input.lora_context,
+        moe_scheme=fused_experts_input.moe_scheme,
+        layer=fused_experts_input.layer,
     )
 
 
@@ -273,7 +256,6 @@ __all__ = [
     "MoERoutingParams",
     "MoETokenDispatchInput",
     "MoETokenDispatchOutput",
-    "MoEWeights",
     "TMoECombineMetadata",
     "build_fused_experts_input",
     "build_token_dispatch_input",

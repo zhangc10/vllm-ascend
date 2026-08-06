@@ -21,7 +21,11 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from torch.nn.functional import pad
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
 
 
@@ -288,6 +292,140 @@ class AscendMoEScheme(ABC):
             Output tensor after MoE computation.
         """
         ...
+
+    @abstractmethod
+    def apply_mlp(
+        self, mlp_compute_input: MoEMlpComputeInput
+    ) -> tuple[torch.Tensor, torch.npu.Event | None]:
+        """Execute MoE MLP compute (GMM1 + activation + requant + GMM2).
+
+        Args:
+            mlp_compute_input: Typed runtime payload carrying hidden states,
+                group list, quant params, and activation config.
+
+        Returns:
+            Tuple of (output hidden states, before_gmm2 event or None).
+        """
+        ...
+
+    @staticmethod
+    def cumsum_group_list(
+        group_list: torch.Tensor,
+        src_list_type: int,
+        dst_list_type: int,
+        active_num: int = 0,
+        expert_num: int = 0,
+    ) -> torch.Tensor:
+        if src_list_type not in [0, 1, 2]:
+            raise ValueError(f"group_list_type should be in [0, 1, 2], but received {src_list_type}")
+
+        if src_list_type == dst_list_type:
+            return group_list
+        if src_list_type == 1 and dst_list_type == 0:
+            return group_list.cumsum(dim=0)
+        if src_list_type == 0 and dst_list_type == 1:
+            group_diff = torch.diff(group_list)
+            new_group = torch.cat([group_list[0].unsqueeze(0), group_diff], dim=0)
+            return new_group
+        if src_list_type == 2 and dst_list_type == 0:
+            experts = pad(group_list[:, 0], (1, 0))
+            tokens = pad(group_list[:, 1].cumsum(dim=0), (1, 0))
+            cumsum_group_list = torch.full(
+                size=(expert_num,), fill_value=active_num, dtype=group_list.dtype, device=group_list.device
+            )
+
+            for i, (start, end) in enumerate(zip(experts[:-1], experts[1:])):
+                if end > start:
+                    cumsum_group_list[start:end] = tokens[i]
+
+            return cumsum_group_list
+        raise NotImplementedError(
+            f"Conversion from src_list_type={src_list_type} to dst_list_type={dst_list_type} is not implemented yet. "
+            "This feature is under development."
+        )
+
+    @staticmethod
+    def _can_use_fused_op(activation) -> bool:
+        """Determine whether a fused GMM+SwiGLU+Quant op can be used
+        for the given activation type.
+
+        Returns False for GELU/GELU_TANH (no fused op supports GELU),
+        SWIGLUSTEP (uses separate gmm1+swiglustep+requant), and
+        swigluoai_uninterleave (fused ops don't support uninterleaved
+        clipped swiglu).
+        """
+        act_name = getattr(activation, "value", activation)
+        return (
+            activation not in (MoEActivation.GELU, MoEActivation.GELU_TANH, MoEActivation.SWIGLUSTEP)
+            and act_name != "swigluoai_uninterleave"
+        )
+
+    @staticmethod
+    def _enable_custom_op() -> bool:
+        from vllm_ascend.utils import enable_custom_op
+
+        return enable_custom_op()
+
+    @staticmethod
+    def _non_fused_act_quant(
+        activation,
+        hidden_states: torch.Tensor,
+        *,
+        swiglu_limit: float = 0.0,
+        swiglu_alpha: float = 1.0,
+        swiglu_beta: float = 0.0,
+        use_mxfp_quant: bool = False,
+        act_quant_type: torch.dtype = torch.float8_e4m3fn,
+        group_list: torch.Tensor | None = None,
+        group_list_type: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Common activation + requantization for the non-fusion path.
+
+        Called after GMM1 produces bf16/fp16 output.  Branches by activation
+        type:
+        - SWIGLUSTEP: swiglustep_forward → npu_dynamic_quant
+        - GELU/GELU_TANH: gelu → npu_dynamic_quant
+        - swigluoai_uninterleave: npu_clipped_swiglu → npu_dynamic_quant
+        - default (silu): swiglu_quant (triton) or npu_swiglu → npu_dynamic_quant
+
+        Returns (hidden_states, swiglu_out_scale).
+        """
+        import torch_npu
+        from vllm_ascend.device.device_op import DeviceOperator
+        from vllm_ascend.ops.activation import AscendSwigluStepAndMul
+
+        if activation == MoEActivation.SWIGLUSTEP:
+            hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=swiglu_limit or 7.0)
+            hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
+                hidden_states, act_quant_type=act_quant_type, use_mxfp_quant=use_mxfp_quant
+            )
+        elif activation in (MoEActivation.GELU, MoEActivation.GELU_TANH):
+            gate, up = hidden_states.chunk(2, dim=-1)
+            approximate = "tanh" if activation == MoEActivation.GELU_TANH else "none"
+            hidden_states = torch.nn.functional.gelu(gate, approximate=approximate) * up
+            hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        elif getattr(activation, "value", activation) == "swigluoai_uninterleave":
+            hidden_states = torch_npu.npu_clipped_swiglu(
+                hidden_states,
+                interleaved=False,
+                alpha=swiglu_alpha,
+                limit=swiglu_limit,
+                bias=swiglu_beta,
+            )
+            hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
+                hidden_states, act_quant_type=act_quant_type, use_mxfp_quant=use_mxfp_quant
+            )
+        else:
+            if HAS_TRITON:
+                from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+
+                hidden_states, swiglu_out_scale = swiglu_quant(
+                    hidden_states, group_list=group_list, group_list_type=group_list_type
+                )
+            else:
+                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        return hidden_states, swiglu_out_scale
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Post-loading weight processing for MoE layer.

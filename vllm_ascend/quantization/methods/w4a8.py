@@ -28,8 +28,8 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, _MEGA_MOE_SUPPORTED, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
-from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD, maybe_trans_nz
+from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput, build_fused_experts_input
+from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD, dispose_tensor, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -551,45 +551,12 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
 
         topk_weights = topk_weights.to(x.dtype)
 
-        if self.dynamic_eplb:
-            w1 = [i.view(torch.int32) for i in layer.w13_weight_list]
-            w1_scale = layer.w13_weight_scale_list
-            w2 = [i.view(torch.int32) for i in layer.w2_weight_list]
-            w2_scale = layer.w2_weight_scale_list
-            w1_scale_bias = layer.w13_scale_bias_list
-            w2_scale_bias = layer.w2_scale_bias_list
-        elif (
-            _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
-            and get_ascend_config().enable_fused_mc2 == 1
-            and _MEGA_MOE_SUPPORTED
-        ):
-            w1 = layer.cann_mega_moe_w13_weight_list
-            w1_scale = layer.cann_mega_moe_w13_weight_scale_list
-            w2 = layer.cann_mega_moe_w2_weight_list
-            w2_scale = layer.cann_mega_moe_w2_weight_scale_list
-
-            def cast_bias_to_fp32(bias):
-                lst = bias if isinstance(bias, list) else [bias]
-                return [t if t.dtype == torch.float32 else t.to(torch.float32) for t in lst]
-
-            w1_scale_bias = cast_bias_to_fp32(layer.cann_mega_moe_w13_scale_bias_list)
-            w2_scale_bias = cast_bias_to_fp32(layer.cann_mega_moe_w2_scale_bias_list)
-        else:
-            w1 = [layer.w13_weight]
-            w1_scale = [layer.w13_weight_scale]
-            w2 = [layer.w2_weight]
-            w2_scale = [layer.w2_weight_scale]
-            w1_scale_bias = [layer.w13_scale_bias.detach()] if hasattr(layer, "w13_scale_bias") else None
-            w2_scale_bias = [layer.w2_scale_bias.detach()] if hasattr(layer, "w2_scale_bias") else None
-
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -599,14 +566,114 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 log2phy=log2phy,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                w1_scale_bias=w1_scale_bias,
-                w2_scale_bias=w2_scale_bias,
                 is_per_channel_weight=self.is_per_channel_weight,
-                swiglu_limit=layer.swiglu_limit,
+                moe_scheme=self,
+                layer=layer,
             )
         )
+
+    def apply_mlp(
+        self, mlp_compute_input: MoEMlpComputeInput
+    ) -> tuple[torch.Tensor, torch.npu.Event | None]:
+        layer = mlp_compute_input.layer
+        hidden_states = mlp_compute_input.hidden_states
+        group_list = mlp_compute_input.group_list
+        group_list_type = mlp_compute_input.group_list_type
+        dynamic_scale = mlp_compute_input.dynamic_scale
+        activation = mlp_compute_input.activation
+
+        swiglu_limit = layer.swiglu_limit
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.0)
+        swiglu_beta = getattr(layer, "swiglu_beta", 0.0)
+
+        if self.dynamic_eplb:
+            w1 = [i.view(torch.int32) for i in layer.w13_weight_list]
+            w1_scale = layer.w13_weight_scale_list
+            w2 = [i.view(torch.int32) for i in layer.w2_weight_list]
+            w2_scale = layer.w2_weight_scale_list
+            w1_scale_bias = layer.w13_scale_bias_list
+            w2_scale_bias = layer.w2_scale_bias_list
+        else:
+            w1 = [layer.w13_weight]
+            w1_scale = [layer.w13_weight_scale]
+            w2 = [layer.w2_weight]
+            w2_scale = [layer.w2_weight_scale]
+            w1_scale_bias = [layer.w13_scale_bias.detach()] if hasattr(layer, "w13_scale_bias") else None
+            w2_scale_bias = [layer.w2_scale_bias.detach()] if hasattr(layer, "w2_scale_bias") else None
+
+        if group_list_type == 0:
+            group_list = torch.cat([group_list[:1], torch.diff(group_list, dim=0)])
+            group_list_type = 1
+        _output_dtype = torch.bfloat16
+        # activation quantization
+        if dynamic_scale is None:
+            unquantized_hidden_states = hidden_states
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=torch.int8
+            )
+            dispose_tensor(unquantized_hidden_states)
+            quantized_hidden_states = None
+        else:
+            pertoken_scale = dynamic_scale
+            quantized_hidden_states = hidden_states
+        # GMM1 + Act + Quant
+        if self._can_use_fused_op(activation) and self._enable_custom_op():
+            hidden_states, swiglu_out_scale = torch.ops._C_ascend.grouped_matmul_swiglu_quant_v2(
+                x=hidden_states,
+                weight=w1,
+                weight_scale=w1_scale,
+                x_scale=pertoken_scale,
+                group_list=group_list,
+                weight_assist_matrix=w1_scale_bias,
+                dequant_mode=0,
+                group_list_type=group_list_type,
+                swiglu_limit=swiglu_limit,
+            )
+            if quantized_hidden_states is not None:
+                dispose_tensor(quantized_hidden_states)
+        else:
+            gmm1_kwargs = {
+                "x": [hidden_states],
+                "weight": w1,
+                "scale": [w1_scale[0].to(w2_scale[0].dtype)],
+                "bias": w1_scale_bias,
+                "per_token_scale": [pertoken_scale],
+                "split_item": 2,
+                "group_type": 0,
+                "group_list": group_list,
+                "group_list_type": group_list_type,
+                "output_dtype": _output_dtype,
+            }
+            hidden_states = torch_npu.npu_grouped_matmul(**gmm1_kwargs)[0]
+            if quantized_hidden_states is not None:
+                dispose_tensor(quantized_hidden_states)
+            hidden_states, swiglu_out_scale = self._non_fused_act_quant(
+                activation,
+                hidden_states,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                use_mxfp_quant=False,
+                act_quant_type=torch.int8,
+                group_list=group_list,
+                group_list_type=group_list_type,
+            )
+
+        before_gmm2_evt = torch.npu.current_stream().record_event()
+        # GMM2
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=w2,
+            scale=w2_scale,
+            bias=w2_scale_bias,
+            per_token_scale=[swiglu_out_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=_output_dtype,
+        )[0]
+        return hidden_states, before_gmm2_evt
 
     def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
         scale = scale.transpose(1, 2).contiguous()

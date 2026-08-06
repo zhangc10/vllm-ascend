@@ -21,12 +21,13 @@ from typing import Any
 
 import torch
 import torch_npu
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.config import get_current_vllm_config
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput, build_fused_experts_input
 
 from .base import AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -310,8 +311,6 @@ class AscendW4A16FusedMoEMethod(AscendMoEScheme):
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=layer.w13_weight_packed,
-                w2=layer.w2_weight_packed,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -321,13 +320,73 @@ class AscendW4A16FusedMoEMethod(AscendMoEScheme):
                 log2phy=log2phy,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w1_offset=layer.w13_weight_offset,
-                w2_offset=layer.w2_weight_offset,
-                swiglu_limit=layer.swiglu_limit,
+                moe_scheme=self,
+                layer=layer,
             )
         )
+
+    def apply_mlp(
+        self, mlp_compute_input: MoEMlpComputeInput
+    ) -> tuple[torch.Tensor, torch.npu.Event | None]:
+        from vllm_ascend.ops.activation import AscendSwigluStepAndMul
+
+        layer = mlp_compute_input.layer
+        hidden_states = mlp_compute_input.hidden_states
+        group_list = mlp_compute_input.group_list
+        group_list_type = mlp_compute_input.group_list_type
+        activation = mlp_compute_input.activation
+
+        _output_dtype = layer.w2_weight_scale.dtype
+        is_gelu_activation = activation in (MoEActivation.GELU, MoEActivation.GELU_TANH)
+        act_name = getattr(activation, "value", activation)
+        swiglu_limit = layer.swiglu_limit
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.0)
+        swiglu_beta = getattr(layer, "swiglu_beta", 0.0)
+
+        # GMM1 + Act
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w13_weight_packed],
+            antiquant_scale=[layer.w13_weight_scale],
+            antiquant_offset=[layer.w13_weight_offset],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=_output_dtype,
+        )[0]
+
+        if activation == MoEActivation.SWIGLUSTEP:
+            hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=swiglu_limit or 7.0)
+        elif is_gelu_activation:
+            gate, up = hidden_states.chunk(2, dim=-1)
+            approximate = "tanh" if activation == MoEActivation.GELU_TANH else "none"
+            hidden_states = torch.nn.functional.gelu(gate, approximate=approximate) * up
+        elif act_name == "swigluoai_uninterleave":
+            hidden_states = torch_npu.npu_clipped_swiglu(
+                hidden_states,
+                interleaved=False,
+                alpha=swiglu_alpha,
+                limit=swiglu_limit,
+                bias=swiglu_beta,
+            )
+        else:
+            hidden_states = torch_npu.npu_swiglu(hidden_states)
+
+        before_gmm2_evt = torch.npu.current_stream().record_event()
+        # GMM2 (antiquant)
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w2_weight_packed],
+            antiquant_scale=[layer.w2_weight_scale],
+            antiquant_offset=[layer.w2_weight_offset],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=_output_dtype,
+        )[0]
+        return hidden_states, before_gmm2_evt
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_shape = layer.w13_weight_packed.data.shape

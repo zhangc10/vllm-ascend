@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 import unittest
+from unittest.mock import MagicMock
 
 import torch
 
@@ -22,7 +23,6 @@ import vllm_ascend.ops.fused_moe.moe_runtime_args as runtime_args
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
     MoETokenDispatchOutput,
-    MoEWeights,
     build_fused_experts_input,
     build_mlp_compute_input,
     build_token_dispatch_input,
@@ -55,7 +55,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
             "MoERoutingParams",
             "MoETokenDispatchInput",
             "MoETokenDispatchOutput",
-            "MoEWeights",
             "TMoECombineMetadata",
             "build_fused_experts_input",
             "build_mlp_compute_input",
@@ -81,12 +80,11 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 hidden_states = torch.randn(4, 8)
                 topk_weights = torch.randn(4, 2)
                 topk_ids = torch.randint(0, 4, (4, 2), dtype=torch.int32)
+                layer = MagicMock()
                 fused_experts_input = build_fused_experts_input(
                     hidden_states=hidden_states,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
-                    w1=torch.randn(2, 8, 16),
-                    w2=torch.randn(2, 16, 8),
                     quant_type=quant_type,
                     dynamic_eplb=True,
                     expert_map=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
@@ -97,6 +95,7 @@ class TestMoERuntimeArgs(unittest.TestCase):
                     pertoken_scale=torch.randn(4),
                     activation="gelu",
                     mxfp_act_quant_type=_get_test_mxfp_dtype(quant_type),
+                    layer=layer,
                 )
 
                 self.assertIs(fused_experts_input.hidden_states, hidden_states)
@@ -107,50 +106,26 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertEqual(fused_experts_input.routing.global_redundant_expert_num, 2)
                 self.assertEqual(fused_experts_input.activation, "gelu")
                 self.assertEqual(fused_experts_input.quant.quant_type, quant_type)
+                self.assertIs(fused_experts_input.layer, layer)
 
-    def test_build_fused_experts_input_merges_dense_and_quant_weights(self):
-        w1 = torch.randn(2, 8, 16)
-        w2 = torch.randn(2, 16, 8)
-        w1_scale = [torch.randn(1)]
-        w2_scale = [torch.randn(1)]
-        w1_scale_bias = torch.randn(1)
-        w2_scale_bias = torch.randn(1)
-        w1_offset = torch.randn(1)
-        w2_offset = torch.randn(1)
-
+    def test_build_fused_experts_input_propagates_layer(self):
+        layer = MagicMock()
         fused_experts_input = build_fused_experts_input(
             hidden_states=torch.randn(4, 8),
             topk_weights=torch.randn(4, 2),
             topk_ids=torch.randint(0, 4, (4, 2), dtype=torch.int32),
-            w1=w1,
-            w2=w2,
             quant_type=QuantType.W8A8,
             dynamic_eplb=False,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w1_scale_bias=w1_scale_bias,
-            w2_scale_bias=w2_scale_bias,
-            w1_offset=w1_offset,
-            w2_offset=w2_offset,
+            layer=layer,
         )
 
-        self.assertIsInstance(fused_experts_input.weights, MoEWeights)
-        self.assertIs(fused_experts_input.weights.w1, w1)
-        self.assertIs(fused_experts_input.weights.w2, w2)
-        self.assertIs(fused_experts_input.weights.w1_scale, w1_scale)
-        self.assertIs(fused_experts_input.weights.w2_scale, w2_scale)
-        self.assertIs(fused_experts_input.weights.w1_scale_bias, w1_scale_bias)
-        self.assertIs(fused_experts_input.weights.w2_scale_bias, w2_scale_bias)
-        self.assertIs(fused_experts_input.weights.w1_offset, w1_offset)
-        self.assertIs(fused_experts_input.weights.w2_offset, w2_offset)
+        self.assertIs(fused_experts_input.layer, layer)
 
     def test_build_token_dispatch_input_supports_remapped_topk_ids(self):
         fused_experts_input = build_fused_experts_input(
             hidden_states=torch.randn(2, 4),
             topk_weights=torch.randn(2, 1),
             topk_ids=torch.tensor([[0], [1]], dtype=torch.int32),
-            w1=torch.randn(1, 4, 8),
-            w2=torch.randn(1, 8, 4),
             quant_type=QuantType.NONE,
             dynamic_eplb=False,
         )
@@ -177,8 +152,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                     hidden_states=torch.randn(2, 8),
                     topk_weights=torch.randn(2, 2),
                     topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
-                    w1=torch.randn(2, 8, 16),
-                    w2=torch.randn(2, 16, 8),
                     quant_type=quant_type,
                     dynamic_eplb=False,
                 )
@@ -191,12 +164,11 @@ class TestMoERuntimeArgs(unittest.TestCase):
         ):
             with self.subTest(quant_type=quant_type):
                 mxfp_dtype = _get_test_mxfp_dtype(quant_type)
+                layer = MagicMock()
                 fused_experts_input = build_fused_experts_input(
                     hidden_states=torch.randn(2, 8, dtype=torch.bfloat16),
                     topk_weights=torch.randn(2, 2),
                     topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
-                    w1=torch.randn(2, 8, 16),
-                    w2=torch.randn(2, 16, 8),
                     quant_type=quant_type,
                     dynamic_eplb=False,
                     mxfp_act_quant_type=mxfp_dtype,
@@ -204,8 +176,7 @@ class TestMoERuntimeArgs(unittest.TestCase):
                     mxfp_scale_dtype=torch.float32,
                     mxfp_per_token_scale_dtype=torch.float16,
                     mxfp_use_bf16=False,
-                    w1_scale=[torch.randn(1)],
-                    w2_scale=[torch.randn(1)],
+                    layer=layer,
                 )
                 token_dispatch_output = MoETokenDispatchOutput(
                     hidden_states=torch.randn(4, 8, dtype=torch.bfloat16),
@@ -226,9 +197,7 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 )
 
                 self.assertIs(mlp_compute_input.hidden_states, token_dispatch_output.hidden_states)
-                self.assertIs(mlp_compute_input.weights, fused_experts_input.weights)
-                self.assertIs(mlp_compute_input.weights.w1_scale, fused_experts_input.weights.w1_scale)
-                self.assertIs(mlp_compute_input.weights.w2_scale, fused_experts_input.weights.w2_scale)
+                self.assertIs(mlp_compute_input.layer, layer)
                 self.assertEqual(mlp_compute_input.fusion, expected_fusion)
                 self.assertTrue(mlp_compute_input.quant.is_mxfp)
                 assert mlp_compute_input.quant.mxfp is not None
@@ -246,8 +215,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                     hidden_states=torch.randn(2, 8, dtype=torch.bfloat16),
                     topk_weights=torch.randn(2, 2),
                     topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
-                    w1=torch.randn(2, 8, 16),
-                    w2=torch.randn(2, 16, 8),
                     quant_type=quant_type,
                     dynamic_eplb=False,
                     mxfp_act_quant_type=mxfp_dtype,
